@@ -9,15 +9,18 @@ const fsp = require('fs/promises');
 const path = require('path');
 const os = require('os');
 
+// Keep sharp's internal memory cache minimal for 512 MB containers
+sharp.cache(false);
+sharp.concurrency(1);
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 const MAX_DURATION_SECONDS = 40;
-const JOB_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const JOB_TTL_MS = 15 * 60 * 1000;
 const TEMP_ROOT = path.join(os.tmpdir(), 'photo-audio-maker');
 
 fs.mkdirSync(TEMP_ROOT, { recursive: true });
 
-// Stream uploads directly to disk to avoid memory spikes on large iPhone 4K MOVs
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     if (!req.jobId) {
@@ -36,13 +39,12 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage,
   limits: {
-    fileSize: 250 * 1024 * 1024 // 250 MB max per file
+    fileSize: 150 * 1024 * 1024 // 150 MB max per file
   }
 });
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Probe uploaded video for duration and audio stream presence
 function probeMedia(filePath) {
   return new Promise((resolve, reject) => {
     ffmpeg.ffprobe(filePath, (err, metadata) => {
@@ -52,7 +54,6 @@ function probeMedia(filePath) {
   });
 }
 
-// Detect HEIC/HEIF by extension or ISO BMFF magic bytes
 function isHeicFile(buffer, originalName) {
   const ext = path.extname(originalName || '').toLowerCase();
   if (ext === '.heic' || ext === '.heif') return true;
@@ -63,7 +64,6 @@ function isHeicFile(buffer, originalName) {
   return false;
 }
 
-// Convert photo (JPEG/PNG/HEIC) into an aspect-ratio-preserved HD frame
 async function prepareImageFrame(inputPath, originalName, outputPath) {
   let imageBuffer = await fsp.readFile(inputPath);
 
@@ -71,7 +71,7 @@ async function prepareImageFrame(inputPath, originalName, outputPath) {
     const converted = await heicConvert({
       buffer: imageBuffer,
       format: 'JPEG',
-      quality: 0.95
+      quality: 0.9
     });
     imageBuffer = Buffer.from(converted);
   }
@@ -81,17 +81,19 @@ async function prepareImageFrame(inputPath, originalName, outputPath) {
     .rotate()
     .toBuffer({ resolveWithObject: true });
 
+  imageBuffer = null; // Free raw buffer immediately
+
   const { width, height } = oriented.info;
 
-  // Choose standard even HD dimensions matching photo orientation
-  let targetW = 1080;
-  let targetH = 1920;
+  // 720p HD dimensions keep FFmpeg RAM usage well under 120 MB on 512 MB instances
+  let targetW = 720;
+  let targetH = 1280;
   if (width > height) {
-    targetW = 1920;
-    targetH = 1080;
+    targetW = 1280;
+    targetH = 720;
   } else if (width === height) {
-    targetW = 1080;
-    targetH = 1080;
+    targetW = 720;
+    targetH = 720;
   }
 
   await sharp(oriented.data)
@@ -99,31 +101,31 @@ async function prepareImageFrame(inputPath, originalName, outputPath) {
       fit: 'contain',
       background: { r: 16, g: 16, b: 18, alpha: 1 }
     })
-    .jpeg({ quality: 92 })
+    .jpeg({ quality: 90 })
     .toFile(outputPath);
 }
 
-// Combine static photo frame + extracted audio into an iOS-compatible MP4
 function renderVideo(framePath, videoPath, outputPath, durationSec) {
   return new Promise((resolve, reject) => {
     ffmpeg()
       .input(framePath)
-      .inputOptions(['-loop 1', '-framerate 30'])
+      .inputOptions(['-loop 1', '-framerate 24'])
       .input(videoPath)
       .outputOptions([
         '-map 0:v:0',
         '-map 1:a:0',
         `-t ${durationSec.toFixed(3)}`,
+        '-threads 1',
         '-c:v libx264',
-        '-preset veryfast',
+        '-preset ultrafast',
         '-tune stillimage',
         '-profile:v main',
         '-level 4.0',
         '-pix_fmt yuv420p',
-        '-r 30',
+        '-r 24',
         '-c:a aac',
-        '-b:a 192k',
-        '-ar 48000',
+        '-b:a 160k',
+        '-ar 44100',
         '-ac 2',
         '-movflags +faststart',
         '-shortest'
@@ -134,7 +136,6 @@ function renderVideo(framePath, videoPath, outputPath, durationSec) {
   });
 }
 
-// Safe file cleanup helper
 async function safeUnlink(filePath) {
   if (!filePath) return;
   try {
@@ -165,7 +166,6 @@ app.post(
     const outputPath = path.join(jobDir, 'output.mp4');
 
     try {
-      // 1. Inspect source video
       const metadata = await probeMedia(videoFile.path);
       const audioStream = (metadata.streams || []).find((s) => s.codec_type === 'audio');
 
@@ -187,16 +187,13 @@ app.post(
       const finalDuration = Math.min(rawDuration, MAX_DURATION_SECONDS);
       const wasTrimmed = rawDuration > MAX_DURATION_SECONDS;
 
-      // 2. Prepare photo frame (HEIC conversion + EXIF rotation + aspect-ratio fit)
       await prepareImageFrame(photoFile.path, photoFile.originalname, framePath);
+      await safeUnlink(photoFile.path); // Free disk/tmpfs space before FFmpeg runs
 
-      // 3. Generate H.264 / AAC MP4
       await renderVideo(framePath, videoFile.path, outputPath, finalDuration);
 
-      // 4. Delete original user uploads immediately
       await Promise.all([
         safeUnlink(videoFile.path),
-        safeUnlink(photoFile.path),
         safeUnlink(framePath)
       ]);
 
@@ -216,7 +213,6 @@ app.post(
   }
 );
 
-// Serve generated video with full HTTP Range support (required for iOS Safari playback)
 app.get('/api/video/:jobId', async (req, res) => {
   const { jobId } = req.params;
   if (!/^[a-f0-9-]{36}$/i.test(jobId)) {
@@ -238,17 +234,15 @@ app.get('/api/video/:jobId', async (req, res) => {
   return res.sendFile(outputPath);
 });
 
-// Handle Multer errors cleanly
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
     return res.status(413).json({
-      error: 'That file is too large. Please choose a video under 250 MB.'
+      error: 'That file is too large. Please choose a video under 150 MB.'
     });
   }
   return res.status(500).json({ error: 'Something went wrong. Please try again.' });
 });
 
-// Periodic cleanup of expired generated videos
 setInterval(async () => {
   try {
     const entries = await fsp.readdir(TEMP_ROOT);
