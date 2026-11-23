@@ -1,7 +1,7 @@
 FROM node:20-slim
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get install -y --no-install-recommends ffmpeg libheif-dev && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -12,4 +12,4 @@ RUN npm install --omit=dev
 COPY . .
 
 EXPOSE 3000
-CMD ["npm", "start"]
+CMD ["node", "--max-old-space-size=256", "server.js"]
